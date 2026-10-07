@@ -1097,7 +1097,7 @@ cat > "$NODE_SYNC_BIN" <<'NODE_SYNC_PY'
 import base64,fcntl,hashlib,ipaddress,json,os,pathlib,re,subprocess,sys,tempfile,time,urllib.parse,uuid
 STATE=pathlib.Path('/var/lib/singbox-node-sync')
 CONFIG=pathlib.Path('/etc/sing-box/config.json')
-OUTPUT=pathlib.Path('/root/singbox_nodes.txt')
+OUTPUT=pathlib.Path('/etc/nodes/sing-box/links.txt')
 RUN=pathlib.Path('/run/singbox-node-sync')
 def run(args,**kw):
     return subprocess.run(args,check=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=20,**kw).stdout
@@ -1111,6 +1111,49 @@ def atomic(p,data):
         os.replace(name,p)
     finally:
         if os.path.exists(name):os.unlink(name)
+# Unified TXT publication only; core configuration and readiness checks stay unchanged.
+NODES=pathlib.Path('/etc/nodes')
+PUBLISH_RUN=pathlib.Path('/run/nodes-publication')
+def link_lines(content):
+    result=[]
+    for line in content.splitlines():
+        line=line.strip()
+        if not line or line.startswith('#'):continue
+        if not re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://\S+$',line):
+            raise RuntimeError('节点链接文件含无效行，保留旧文件')
+        if line not in result:result.append(line)
+    return result
+def publish_nodes(content):
+    lines=link_lines(content)
+    if not lines:raise RuntimeError('未生成有效节点，保留旧文件')
+    PUBLISH_RUN.mkdir(parents=True,exist_ok=True);os.chmod(PUBLISH_RUN,0o700)
+    NODES.mkdir(parents=True,exist_ok=True);os.chmod(NODES,0o700)
+    with open(PUBLISH_RUN/'lock','a') as publication_lock:
+        os.chmod(PUBLISH_RUN/'lock',0o600)
+        fcntl.flock(publication_lock,fcntl.LOCK_EX)
+        merged=[]
+        for group in ('argo','sing-box','xray'):
+            source=NODES/group/'links.txt'
+            entries=lines if group=='sing-box' else (link_lines(source.read_text()) if source.exists() else [])
+            for line in entries:
+                if line not in merged:merged.append(line)
+        targets=[(OUTPUT,'\n'.join(lines)+'\n'),
+                 (NODES/'subscription.txt','\n'.join(merged)+'\n')]
+        previous={p:p.read_bytes() if p.exists() else None for p,_ in targets}
+        touched=[]
+        try:
+            for p,text in targets:
+                if previous[p]!=text.encode():
+                    touched.append(p);atomic(p,text)
+                else:os.chmod(p,0o600)
+            os.chmod(OUTPUT.parent,0o700)
+        except Exception:
+            for p in reversed(touched):
+                if previous[p] is None:
+                    if p.exists():p.unlink()
+                else:atomic(p,previous[p])
+            raise
+
 def write(p,data):atomic(p,json.dumps(data,ensure_ascii=False))
 def digest(data):return hashlib.sha256(data).hexdigest()
 def checked_config():
@@ -1234,8 +1277,8 @@ def sync():
     content=generate(cfg,read(STATE/'deployment.json'))
     # Slow geolocation must not allow a service restart or config edit to race the write.
     if process()!=(pid,ticks) or CONFIG.read_bytes()!=data or read(RUN/'active.json')!=active:raise RuntimeError('生成期间配置或进程改变，保留旧文件')
-    if not OUTPUT.exists() or OUTPUT.read_text()!=content:
-        atomic(OUTPUT,content);print(time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())+' 节点文件已更新',flush=True)
+    publish_nodes(content)
+
 def main():
     STATE.mkdir(parents=True,exist_ok=True);RUN.mkdir(parents=True,exist_ok=True)
     os.chmod(STATE,0o700);os.chmod(RUN,0o700)
@@ -1416,8 +1459,10 @@ check_port \
 # 生成节点 URI
 # ============================================================
 
-SUB_FILE="/root/singbox_nodes.txt"
-SUB_STAGE=$(mktemp /root/.singbox_nodes.install.XXXXXX)
+SUB_FILE="/etc/nodes/sing-box/links.txt"
+mkdir -p /etc/nodes/sing-box
+chmod 700 /etc/nodes /etc/nodes/sing-box
+SUB_STAGE=$(mktemp /etc/nodes/sing-box/.links.install.XXXXXX)
 chmod 600 "$SUB_STAGE"
 trap 'rm -f "$SUB_STAGE"' EXIT
 : > "$SUB_STAGE"
@@ -1625,7 +1670,8 @@ log "=================== 订阅文件内容 ==================="
 cat "$SUB_FILE"
 
 log ""
-log "订阅文件已保存到：$SUB_FILE"
+log "节点链接已保存到：$SUB_FILE"
+log "合并订阅：/etc/nodes/subscription.txt"
 
 log ""
 log "=================== 部署完成 ==================="
